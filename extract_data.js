@@ -261,6 +261,34 @@ async function createStealthPage() {
   return page;
 }
 
+async function humanLikeScroll(page) {
+  await page.evaluate(async () => {
+    function delay(ms) {
+      return new Promise((res) => setTimeout(res, ms));
+    }
+
+    let totalHeight = 0;
+    const distance = window.innerHeight * 0.7; // scroll step (حوالي 70% من الشاشة)
+
+    while (totalHeight < document.body.scrollHeight) {
+      // scroll خطوة خطوة
+      window.scrollBy(0, distance);
+
+      totalHeight += distance;
+
+      // عشوائية الوقوف (بين نص ثانية لـ 3 ثواني)
+      const pause = Math.floor(Math.random() * 2500) + 500;
+      await delay(pause);
+
+      // احتمال 1 من 5 يطلع شوية لفوق
+      if (Math.random() < 0.2) {
+        window.scrollBy(0, -Math.floor(Math.random() * 200));
+        await delay(Math.floor(Math.random() * 1000));
+      }
+    }
+  });
+}
+
 // Extract listing details
 async function extractListingDetails(page, url) {
   try {
@@ -271,6 +299,7 @@ async function extractListingDetails(page, url) {
 
     // Wait for main content to load
     try {
+      await humanLikeScroll(page);
       await page.waitForSelector("h1.text-body_1.text-gray__dark_2", {
         timeout: 10000,
       });
@@ -314,6 +343,9 @@ async function extractListingDetails(page, url) {
         advertiserAdsCount: getText(
           "section.container-fluid div.justify-between div.flex-1 p.pb-2x.text-gray__dark_1.text-body_2"
         ),
+        location: getText(
+          "section.flex-col-reverse a p.text-body_2.truncated-text"
+        ),
       };
 
       // Building type and ad date
@@ -330,11 +362,14 @@ async function extractListingDetails(page, url) {
       const descSpans = document.querySelectorAll(
         "section.gap-y-3x div.col-span-9 div span"
       );
+
       if (descSpans.length > 0) {
-        const descArray = Array.from(descSpans).slice(0, -1);
-        data.description = descArray
-          .map((span) => span.textContent.trim())
-          .join("\n");
+        const descArray = Array.from(descSpans)
+          // استبعاد أي span عنده class فيها "text-link"
+          .filter((span) => !span.classList.contains("text-link"))
+          .map((span) => span.textContent.trim());
+
+        data.description = descArray.join("\n");
       }
 
       // Ad data (dynamic fields)
@@ -348,200 +383,8 @@ async function extractListingDetails(page, url) {
       return data;
     });
 
-    // Try to get phone number
-    let phoneNumber = null;
-    let whatsappNumber = null;
-
-    try {
-      await page.evaluate(() => {
-        const removeModal = () => {
-          const el = document.getElementById("relatedListingsModal");
-          if (el) el.remove();
-        };
-
-        // run once in case it's already there
-        removeModal();
-
-        // observer for future mutations
-        const observer = new MutationObserver(() => removeModal());
-        observer.observe(document.body, { childList: true, subtree: true });
-      });
-
-      console.log("Starting phone extraction...");
-      await delay(2000);
-
-      // === PHONE NUMBER EXTRACTION ===
-      // First check if call button exists
-      const callButtonExists = await page.$(
-        'section#stickyDiv div.flex-1.flex-grow button[aria-label="call-to-action"].\\!bg-blue'
-      );
-
-      if (!callButtonExists) {
-        console.log("No call button found - skipping phone extraction");
-      } else {
-        // Click call button
-        await page.click(
-          'section#stickyDiv div.flex-1.flex-grow button[aria-label="call-to-action"].\\!bg-blue'
-        );
-        console.log("Call button clicked");
-        await delay(3000); // Increased delay
-
-        // Close first popup (registerModal)
-        try {
-          await page.waitForSelector(
-            'dialog#registerModal form[method="dialog"].flex.content-center button.bg-transparent',
-            {
-              timeout: 5000,
-              visible: true,
-            }
-          );
-          await delay(500); // Small delay before clicking
-          await page.click(
-            'dialog#registerModal form[method="dialog"].flex.content-center button.bg-transparent'
-          );
-          console.log("Closed registerModal");
-          await delay(2000);
-        } catch (e) {
-          console.log("registerModal not found");
-        }
-
-        // Close second popup (quickLeadCloseSurvey)
-        try {
-          await page.waitForSelector(
-            'dialog#quickLeadCloseSurvey form[method="dialog"].flex.content-center button.bg-transparent',
-            {
-              timeout: 5000,
-              visible: true,
-            }
-          );
-          await delay(500);
-          await page.click(
-            'dialog#quickLeadCloseSurvey form[method="dialog"].flex.content-center button.bg-transparent'
-          );
-          console.log("Closed quickLeadCloseSurvey");
-          await delay(2000);
-        } catch (e) {
-          console.log("quickLeadCloseSurvey not found");
-        }
-
-        // Wait for phone dialog to appear and extract phone
-        try {
-          await page.waitForSelector("dialog#listingPhones", {
-            timeout: 8000,
-            visible: true,
-          });
-          console.log("Phone dialog appeared");
-
-          // Extract phone number before closing dialog
-          phoneNumber = await page.evaluate(() => {
-            const phoneEl = document.querySelector(
-              'div.flex-col.bg-white.w-full div.justify-items-center.w-100 button[aria-label="show-tooltip"] span.text-title_4'
-            );
-            return phoneEl ? phoneEl.textContent.trim() : null;
-          });
-          console.log("Phone number:", phoneNumber);
-
-          // Now close the phone dialog
-          await page.click(
-            'dialog#listingPhones form[method="dialog"] button.bg-transparent'
-          );
-          console.log("Closed listingPhones");
-          await delay(2000);
-        } catch (e) {
-          console.log("listingPhones not found or error:", e.message);
-        }
-      }
-
-      // === WHATSAPP NUMBER EXTRACTION (OPTIONAL) ===
-      try {
-        // Wait a bit before checking for WhatsApp
-        await delay(1000);
-
-        // Check if WhatsApp button exists
-        const whatsappButtonExists = await page.evaluate(() => {
-          const button = document.querySelector(
-            'section#stickyDiv div.flex-1.flex-grow button[aria-label="call-to-action"].\\!bg-whatsapp'
-          );
-          return button !== null && !button.disabled;
-        });
-
-        if (whatsappButtonExists) {
-          console.log("WhatsApp button found, extracting number...");
-
-          // Store current pages count
-          const pagesBefore = (await browser.pages()).length;
-
-          // Click WhatsApp button
-          await page.click(
-            'section#stickyDiv div.flex-1.flex-grow button[aria-label="call-to-action"].\\!bg-whatsapp'
-          );
-          console.log("WhatsApp button clicked");
-
-          // Wait for new tab to open
-          await delay(3000);
-
-          // Handle new tab
-          const pagesAfter = await browser.pages();
-          if (pagesAfter.length > pagesBefore) {
-            // Close the new WhatsApp tab
-            await pagesAfter[pagesAfter.length - 1].close();
-            console.log("Closed WhatsApp tab");
-            await delay(1000);
-          }
-
-          // Close survey popup after WhatsApp
-          try {
-            await page.waitForSelector(
-              "dialog#quickLeadCloseSurvey button.bg-transparent",
-              {
-                timeout: 5000,
-                visible: true,
-              }
-            );
-            await delay(500);
-            await page.click(
-              "dialog#quickLeadCloseSurvey button.bg-transparent"
-            );
-            console.log("Closed WhatsApp survey");
-            await delay(2000);
-          } catch (e) {
-            console.log("WhatsApp survey not found");
-          }
-
-          // Wait for WhatsApp dialog to appear
-          try {
-            await page.waitForSelector(
-              "dialog#listingPhones button.justify-between span.text-title_4",
-              {
-                timeout: 5000,
-                visible: true,
-              }
-            );
-
-            // Get WhatsApp number from dialog
-            whatsappNumber = await page.evaluate(() => {
-              const whatsappEl = document.querySelector(
-                "dialog#listingPhones button.justify-between span.text-title_4"
-              );
-              return whatsappEl ? whatsappEl.textContent.trim() : null;
-            });
-            console.log("WhatsApp number:", whatsappNumber);
-          } catch (e) {
-            console.log("WhatsApp phone dialog not found");
-          }
-        } else {
-          console.log("No WhatsApp button found on this listing");
-        }
-      } catch (whatsappError) {
-        console.log("WhatsApp extraction skipped:", whatsappError.message);
-      }
-    } catch (error) {
-      console.log("Phone extraction error:", error.message);
-    }
-    await delay(500);
-
-    details.phoneNumber = phoneNumber;
-    details.whatsappNumber = whatsappNumber;
+    details.phoneNumber = null;
+    details.whatsappNumber = null;
     details.url = url;
     details.scrapedAt = new Date();
 

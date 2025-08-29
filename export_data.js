@@ -1,53 +1,75 @@
+// export_mongo.js
 const { MongoClient } = require("mongodb");
-const XLSX = require("xlsx");
+const ExcelJS = require("exceljs");
 
-async function exportToExcel() {
-  // بيانات الاتصال
-  const uri = "mongodb://localhost:27017"; // عدلها لو DB مش لوكال
-  const dbName = "aqarmap_scraper";
-  const collectionName = "listing_details";
+const config = {
+  uri: "mongodb://localhost:27017",
+  database: "aqarmap_scraper",
+  collection: "listing_details",
+};
 
-  const client = new MongoClient(uri);
+async function exportMongoToExcel(outputFile) {
+  const client = new MongoClient(config.uri);
 
   try {
     await client.connect();
-    const db = client.db(dbName);
-    const collection = db.collection(collectionName);
+    console.log("✅ Connected to MongoDB");
 
-    // هات كل الداتا
+    const db = client.db(config.database);
+    const collection = db.collection(config.collection);
+
+    // هنجمع كل البيانات
     const docs = await collection.find({}).toArray();
+    console.log(`📦 Found ${docs.length} documents`);
 
-    // جهز الداتا للـ Excel (تجاهل _id و scrapedAt)
-    const data = docs.map(doc => ({
-      title: doc.title || "",
-      area: doc.area || "",
-      price: doc.price || "",
-      advertiserName: doc.advertiserName || "",
-      advertiserLink: doc.advertiserLink || "",
-      advertiserAdsCount: doc.advertiserAdsCount || "",
-      buildingType: doc.buildingType || "",
-      adDate: doc.adDate || "",
-      description: doc.description || "",
-      adData: Array.isArray(doc.adData) ? doc.adData.join(" - ") : "",
-      phoneNumber: doc.phoneNumber || "",
-      whatsappNumber: doc.whatsappNumber || "",
-      url: doc.url || ""
-    }));
+    // الحقول اللي مش عايزينها
+    const excludeFields = [
+      "_id",
+      "scrapedAt",
+      "phoneUpdatedAt",
+      "whatsappUpdatedAt",
+    ];
 
-    // اعمل شيت
-    const worksheet = XLSX.utils.json_to_sheet(data);
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, "Listings");
+    if (docs.length === 0) {
+      console.log("⚠️ No data found");
+      return;
+    }
 
-    // اكتب الملف
-    XLSX.writeFile(workbook, "listings.xlsx");
+    // تجهيز الأعمدة بناءً على أول سجل
+    const sample = docs[0];
+    const columns = Object.keys(sample)
+      .filter((key) => !excludeFields.includes(key))
+      .map((key) => ({ header: key, key }));
 
-    console.log("✅ تم تصدير البيانات بنجاح إلى listings.xlsx");
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Ads Data");
+    worksheet.columns = columns;
+
+    // إضافة البيانات
+    docs.forEach((row) => {
+      const filteredRow = {};
+      for (let key of Object.keys(row)) {
+        if (!excludeFields.includes(key)) {
+          if (Array.isArray(row[key])) {
+            filteredRow[key] = row[key].join(", ");
+          } else if (typeof row[key] === "object" && row[key] !== null) {
+            filteredRow[key] = JSON.stringify(row[key]);
+          } else {
+            filteredRow[key] = row[key];
+          }
+        }
+      }
+      worksheet.addRow(filteredRow);
+    });
+
+    await workbook.xlsx.writeFile(outputFile);
+    console.log(`✅ Excel file created: ${outputFile}`);
   } catch (err) {
-    console.error("❌ حصل خطأ:", err);
+    console.error("❌ Error:", err);
   } finally {
     await client.close();
   }
 }
 
-exportToExcel();
+// تشغيل السكربت
+exportMongoToExcel("aqarmap_ads.xlsx");

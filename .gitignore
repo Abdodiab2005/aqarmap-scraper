@@ -1,4 +1,8 @@
 node_modules
 cookies.json
-listings.xlsx
 progress.json
+wgcf-account.toml
+wgcf-profile.conf
+auth.json
+test.js
+.env
