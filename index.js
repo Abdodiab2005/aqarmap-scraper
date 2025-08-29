@@ -77,7 +77,7 @@ async function main() {
   const _db = await db(cfg.mongo.uri, cfg.mongo.dbName);
 
   const browser = await puppeteer.launch({
-    headless: false,
+    headless: true,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
