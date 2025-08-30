@@ -33,7 +33,7 @@ module.exports = {
   ],
 
   // Seeding & scraping
-  seed: { firstPages: 5 }, // أول مرحلة: هنجمع URLs لأول 5 صفحات
+  seed: { firstPages: 0 },
   scraping: {
     maxConcurrentPages: 999, // هنحسب الأفضل بناءً على الجهاز، القيمة هنا سقف فقط
     batchSize: 50, // كل Batch من الـ URLs

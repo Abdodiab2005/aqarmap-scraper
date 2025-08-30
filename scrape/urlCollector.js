@@ -78,7 +78,7 @@ async function seedFirstPages({
   baseUrl,
   searchUrl,
   listSelector,
-  pagesCount,
+  pagesCount = 0,
   viewport,
   userAgents,
   saveUrl,
@@ -89,9 +89,12 @@ async function seedFirstPages({
   let pageNum = 1;
   let ended = false;
 
+  const limit = Number(pagesCount || 0);
+  const crawlAll = !limit || limit <= 0;
+
   logger.info({ searchUrl, pagesCount }, "[seed] start");
 
-  while (pageNum <= pagesCount && !ended) {
+  while ((crawlAll || pageNum <= limit) && !ended) {
     const url = `${searchUrl}${
       searchUrl.includes("?") ? "&" : "?"
     }page=${pageNum}`;
@@ -107,8 +110,6 @@ async function seedFirstPages({
         { pageNum, url, err: msg },
         "[seed] navigation/selector error — retry once"
       );
-
-      // محاولة تانية خفيفة
       try {
         await sleep(1200);
         await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
@@ -124,18 +125,16 @@ async function seedFirstPages({
       }
     }
 
-    // اجمع الروابط من الصفحة
     let links = [];
     try {
       links = await page.evaluate(
-        (sel, base) => {
-          return Array.from(document.querySelectorAll(sel))
+        (sel, base) =>
+          Array.from(document.querySelectorAll(sel))
             .map((a) => {
               const href = a.getAttribute("href");
               return href && (href.startsWith("http") ? href : base + href);
             })
-            .filter(Boolean);
-        },
+            .filter(Boolean),
         listSelector,
         baseUrl
       );
@@ -148,7 +147,6 @@ async function seedFirstPages({
       continue;
     }
 
-    // كشف التكرار
     const beforeCount = seen.size;
     for (const l of links) seen.add(l);
     const savedNow = seen.size - beforeCount;
@@ -158,7 +156,6 @@ async function seedFirstPages({
       "[seed] page parsed"
     );
 
-    // خزّن في DB عبر callback
     for (const link of links) {
       try {
         await saveUrl(link);
@@ -170,6 +167,7 @@ async function seedFirstPages({
       }
     }
 
+    // 👇 علامة نهاية طبيعية: مفيش روابط جديدة (بدأ التكرار)
     if (savedNow === 0) {
       logger.info(
         { pageNum },
@@ -183,9 +181,9 @@ async function seedFirstPages({
     pageNum++;
   }
 
-  if (!ended && pageNum > pagesCount) {
+  if (!ended && !crawlAll && pageNum > limit) {
     logger.info(
-      { pagesCount },
+      { pagesCount: limit },
       "[seed] reached configured pagesCount — stopping"
     );
   }
