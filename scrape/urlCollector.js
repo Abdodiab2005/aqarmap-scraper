@@ -1,26 +1,25 @@
-// urlCollector.js
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 puppeteer.use(StealthPlugin());
 
 const fs = require("fs");
+const path = require("path");
 const logger = require("../utils/logger");
 const config = require("../config");
-let mongo;
+
+let mongo = null;
 try {
+  // لو ماعندكش ./db/mongo عادي هيكمل بدون حفظ DB
   mongo = require("../db/mongo");
-} catch (_) {
-  mongo = null;
-}
+} catch (_) {}
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function preparePage(page) {
-  await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-  );
+async function preparePage(page, optUA) {
+  const ua =
+    optUA ||
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+  await page.setUserAgent(ua);
   await page.setExtraHTTPHeaders({
     "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7",
   });
@@ -96,38 +95,86 @@ async function detectMaxPage(page) {
   }
 }
 
-async function collectOneTarget(
-  { name, url: rawUrl, startPage, maxPage },
-  resumeStrategy
-) {
-  // نظّف أي &amp; واردة من الـ config بدون ما نطلب منك تغيّرها
-  const seedUrl = rawUrl.replace(/&amp;/g, "&");
-  const progressKey = `urlCollector:${name}`;
-
-  // حدّد صفحة البداية
-  let from = startPage || 1;
-  if (resumeStrategy === "progress") {
-    const saved = readProgress(config.progressFile, progressKey);
-    if (saved && Number.isInteger(saved.lastPage))
-      from = Math.max(1, saved.lastPage + 1);
+/**
+ * API متوافق مع index.js:
+ * seedFirstPages({ browser, searchUrl, listSelector, pagesCount, viewport, userAgents,
+ *                  startPage, resumeStrategy, progressKey, saveUrl })
+ *
+ * - pagesCount = 0  => امسح كل الصفحات حتى آخر صفحة
+ * - startPage يأتي من الـ config.target.startPage (أو 1)
+ * - resumeStrategy = "config" | "progress"
+ * - progressKey (اختياري) مفتاح التخزين في progress.json
+ */
+async function seedFirstPages(opts) {
+  if (!opts || typeof opts !== "object") {
+    throw new Error("seedFirstPages: options object is required");
   }
 
-  logger.info("🎯 starting target", { target: name, searchUrl: rawUrl });
-  const browser = await puppeteer.launch({
-    headless: "new", // يحل التحذير بتاع الهيدلس
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  });
+  const {
+    browser,
+    searchUrl,
+    listSelector,
+    pagesCount = 0,
+    viewport,
+    userAgents = [],
+    startPage = 1,
+    resumeStrategy = "config",
+    progressKey,
+    saveUrl,
+  } = opts;
+
+  if (!browser || typeof browser.createIncognitoBrowserContext !== "function") {
+    throw new Error("seedFirstPages: valid puppeteer browser is required");
+  }
+  if (!searchUrl || typeof searchUrl !== "string") {
+    throw new Error("seedFirstPages: searchUrl (string) is required");
+  }
+  if (typeof saveUrl !== "function") {
+    throw new Error("seedFirstPages: saveUrl callback is required");
+  }
+
+  // طهّر أي &amp; في الرابط
+  const seedUrl = searchUrl.replace(/&amp;/g, "&");
+  const pKey =
+    progressKey ||
+    "seed:" +
+      Buffer.from(seedUrl).toString("base64").replace(/=+$/, "").slice(0, 16);
+
   const context = await browser.createIncognitoBrowserContext();
   const page = await context.newPage();
-  await preparePage(page);
-
-  // اكتشف آخر صفحة لو مش متحدّد
-  let to = maxPage;
-  if (!to) {
-    const st = await openAndStatus(page, seedUrl);
-    if (st === 403) logger.warn("[seed] seed page 403 — هنكمل ونحاول");
-    to = await detectMaxPage(page);
+  if (viewport) {
+    try {
+      await page.setViewport(viewport);
+    } catch {}
   }
+  await preparePage(page, userAgents[0]);
+
+  // حدّد صفحة البداية
+  let from = Math.max(1, parseInt(startPage, 10) || 1);
+  if (resumeStrategy === "progress") {
+    const saved = readProgress(config.progressFile, pKey);
+    if (saved && Number.isInteger(saved.lastPage)) {
+      from = Math.max(1, saved.lastPage + 1);
+    }
+  }
+
+  // حدّد صفحة النهاية
+  let to;
+  const st = await openAndStatus(page, seedUrl);
+  if (st === 403) {
+    logger.warn(
+      "[seed] seed page 403 — will still attempt pagination detection"
+    );
+  }
+  const detectedMax = await detectMaxPage(page);
+
+  if (pagesCount && pagesCount > 0) {
+    to = from + pagesCount - 1;
+  } else {
+    to = detectedMax;
+  }
+
+  logger.info("[seed] plan", { from, to, pagesCount, resumeStrategy, pKey });
 
   for (let p = from; p <= to; p++) {
     const pageUrl = seedUrl + (seedUrl.includes("?") ? "&" : "?") + `page=${p}`;
@@ -136,7 +183,7 @@ async function collectOneTarget(
     const status = await openAndStatus(page, pageUrl);
     if (status === 403) {
       logger.warn("[seed] 403 — skip page", { pageNum: p });
-      writeProgress(config.progressFile, progressKey, {
+      writeProgress(config.progressFile, pKey, {
         lastPageTried: p,
         lastPage: p - 1,
       });
@@ -144,12 +191,12 @@ async function collectOneTarget(
       continue;
     }
 
-    // استنّى وجود الكروت
+    // استنّى وجود عناصر القايمة
+    const selector =
+      (typeof listSelector === "string" && listSelector.trim()) ||
+      'a[href^="/ar/for-"], a[href^="/ar/listing"]';
     try {
-      await page.waitForSelector(
-        'a[href^="/ar/"][class*="card"], a[href^="/ar/for-"]',
-        { timeout: 15000 }
-      );
+      await page.waitForSelector(selector, { timeout: 15000 });
     } catch (err) {
       logger.warn("[seed] selector wait failed — retry after scroll", {
         pageNum: p,
@@ -157,16 +204,13 @@ async function collectOneTarget(
       });
       try {
         await humanLikeScroll(page);
-        await page.waitForSelector(
-          'a[href^="/ar/"][class*="card"], a[href^="/ar/for-"]',
-          { timeout: 12000 }
-        );
+        await page.waitForSelector(selector, { timeout: 12000 });
       } catch (err2) {
         logger.error("[seed] failed after retry — skip page", {
           pageNum: p,
           err: String(err2),
         });
-        writeProgress(config.progressFile, progressKey, {
+        writeProgress(config.progressFile, pKey, {
           lastPageTried: p,
           lastPage: p - 1,
         });
@@ -174,68 +218,66 @@ async function collectOneTarget(
       }
     }
 
-    // اجمع الروابط
-    const links = await page.$$eval('a[href^="/ar/"]', (as) =>
-      Array.from(
-        new Set(
-          as
-            .map((a) => a.href)
-            .filter((u) =>
-              /aqarmap\.com\.eg\/ar\/(for|listing|realestate)/.test(u)
-            )
+    // استخراج الروابط
+    let links = [];
+    try {
+      // لو السيلكتور Anchor — خُده مباشرة
+      links = await page.$$eval(selector, (nodes) =>
+        Array.from(
+          new Set(
+            nodes
+              .map((n) => {
+                // يدعم لو السيلكتور عنصر داخلي جوّا الكارت
+                const a =
+                  n.tagName === "A" ? n : n.closest && n.closest("a[href]");
+                return a ? a.href : null;
+              })
+              .filter(Boolean)
+          )
         )
-      )
-    );
+      );
+    } catch {
+      // fallback شامل
+      links = await page.$$eval('a[href^="/ar/"]', (as) =>
+        Array.from(
+          new Set(
+            as
+              .map((a) => a.href)
+              .filter((u) =>
+                /aqarmap\.com\.eg\/ar\/(for|listing|realestate)/.test(u)
+              )
+          )
+        )
+      );
+    }
 
-    if (links.length) {
-      if (mongo && typeof mongo.upsertMany === "function") {
-        await mongo.upsertMany(
-          "seed_urls",
-          links.map((u) => ({
-            url: u,
-            source: name,
-            state: "new",
-          }))
-        );
+    // حفظ الروابط (عبر callback)
+    for (const u of links) {
+      try {
+        await saveUrl(u);
+      } catch (e) {
+        logger.debug("[seed] saveUrl failed", { url: u, err: String(e) });
       }
     }
 
     logger.info("[seed] collected", { pageNum: p, count: links.length });
-    writeProgress(config.progressFile, progressKey, {
+
+    // حفظ التقدم
+    writeProgress(config.progressFile, pKey, {
       lastPageTried: p,
       lastPage: p,
     });
+
+    // تبطيء بسيط
     await sleep(2000 + Math.random() * 3000);
   }
 
   try {
     await context.close();
   } catch {}
-  try {
-    await browser.close();
-  } catch {}
-  logger.info("[seed] done", { name, ended: true });
-}
-
-/**
- * === واجهة متوافقة مع index.js القديم ===
- * seedFirstPages: يبدأ من startPage (أو progress) ويكمل حتى maxPage/الحد الأقصى
- */
-async function seedFirstPages(target, opts = {}) {
-  const resumeStrategy =
-    opts.resumeStrategy || config.resumeStrategy || "config";
-  await collectOneTarget(target, resumeStrategy);
-}
-
-/**
- * اختياري: تسييد مدى صفحات محدد
- */
-async function seedPagesRange(target, fromPage, toPage) {
-  const t = { ...target, startPage: fromPage, maxPage: toPage };
-  await collectOneTarget(t, "config");
+  logger.info("[seed] done", { progressKey: pKey });
 }
 
 module.exports = {
   seedFirstPages,
-  seedPagesRange,
 };

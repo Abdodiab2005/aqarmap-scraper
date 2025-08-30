@@ -1,19 +1,33 @@
 require("dotenv").config();
-// src/index.js (مقتطفات أساسية — يفضّل استبدال الملف عندك بالنسخة دي)
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 puppeteer.use(StealthPlugin());
 
 const os = require("os");
 const path = require("path");
-const { db } = require("./db/mongo");
 const cfg = require("./config");
 const logger = require("./utils/logger");
+
+let dbModule = null;
+try {
+  dbModule = require("./db/mongo");
+} catch (_) {}
+
 const { seedFirstPages } = require("./scrape/urlCollector");
-const { processListing } = require("./scrape/detailScraper");
-// const { runPhoneStage } = require("./phones/phoneFetcher");
-const { exportCollectionToExcel } = require("./exporter");
-const { init: initTG, notify } = require("./utils/telegram");
+let processListing = null;
+try {
+  processListing = require("./scrape/detailScraper").processListing;
+} catch (_) {}
+
+let exporter = null;
+try {
+  exporter = require("./exporter");
+} catch (_) {}
+
+let tg = { init: () => {}, notify: async () => {} };
+try {
+  tg = require("./utils/telegram");
+} catch (_) {}
 
 function calcOptimalConcurrency(maxCap) {
   const freeMem = os.freemem();
@@ -26,13 +40,17 @@ function calcOptimalConcurrency(maxCap) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function workerPool({ browser, urlsCol, detailsCol, docs, concurrency }) {
+  if (!processListing) {
+    logger.warn("processListing not available — skipping details scraping");
+    return;
+  }
   logger.info({ batch: docs.length, concurrency }, "🚦 starting worker pool");
-  const pages = await Promise.all(
-    Array.from({ length: Math.min(concurrency, docs.length) }, async () => {
-      const p = await browser.newPage();
-      return p;
-    })
-  );
+  const tabs = Math.min(concurrency, docs.length);
+  const pages = [];
+  for (let i = 0; i < tabs; i++) {
+    const p = await browser.newPage();
+    pages.push(p);
+  }
 
   let idx = 0;
   let ok = 0,
@@ -59,7 +77,7 @@ async function workerPool({ browser, urlsCol, detailsCol, docs, concurrency }) {
         );
         fail++;
       }
-      await sleep(200); // بريك بسيط بين جوبات نفس العامل
+      await sleep(200);
     }
     try {
       await page.close();
@@ -72,12 +90,18 @@ async function workerPool({ browser, urlsCol, detailsCol, docs, concurrency }) {
 }
 
 async function main() {
-  initTG(cfg.telegram.token);
+  try {
+    tg.init(cfg.telegram.token);
+  } catch {}
   const chatId = cfg.telegram.chatId;
-  const _db = await db(cfg.mongo.uri, cfg.mongo.dbName);
+
+  let _db = null;
+  if (dbModule && typeof dbModule.db === "function") {
+    _db = await dbModule.db(cfg.mongo.uri, cfg.mongo.dbName);
+  }
 
   const browser = await puppeteer.launch({
-    headless: true,
+    headless: "new",
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -98,29 +122,41 @@ async function main() {
 
   try {
     logger.info("🚀 Pipeline started");
-    await notify(chatId, "🚀 *Pipeline started*");
+    try {
+      await tg.notify(chatId, "🚀 *Pipeline started*");
+    } catch {}
 
     for (const target of cfg.targets) {
-      const { url: searchUrl, name } = target;
-      const urlsCol = _db.collection(`${name}_urls`);
-      const detailsCol = _db.collection(name);
+      const { url: searchUrl, name, startPage } = target;
 
-      await urlsCol.createIndex({ url: 1 }, { unique: true });
-      await detailsCol.createIndex({ url: 1 }, { unique: true });
+      let urlsCol = null;
+      let detailsCol = null;
+      if (_db) {
+        urlsCol = _db.collection(`${name}_urls`);
+        detailsCol = _db.collection(name);
+        await urlsCol.createIndex({ url: 1 }, { unique: true });
+        await detailsCol.createIndex({ url: 1 }, { unique: true });
+      }
 
       logger.info({ target: name, searchUrl }, "🎯 starting target");
-      await notify(chatId, `🧭 Target: *${name}*\n🔗 ${searchUrl}`);
+      try {
+        await tg.notify(chatId, `🧭 Target: *${name}*\n🔗 ${searchUrl}`);
+      } catch {}
 
-      // 1) SEED (أول 5 صفحات)
+      // === 1) SEED ===
       await seedFirstPages({
         browser,
-        baseUrl: cfg.baseUrl,
         searchUrl,
         listSelector: cfg.scraping.listSelector,
-        pagesCount: cfg.seed.firstPages,
+        pagesCount: cfg.seed.firstPages, // 0 = امسح كل الصفحات
         viewport: cfg.scraping.viewport,
         userAgents: cfg.scraping.userAgents,
+        startPage: startPage || 1,
+        resumeStrategy: cfg.resumeStrategy,
+        progressKey: `seed:${name}`,
         saveUrl: async (url) => {
+          if (!url) return;
+          if (!urlsCol) return;
           try {
             await urlsCol.updateOne(
               { url },
@@ -131,70 +167,80 @@ async function main() {
         },
       });
       logger.info({ target: name }, "✅ seeding finished");
-      await notify(chatId, `✅ Seeding finished for *${name}*`);
+      try {
+        await tg.notify(chatId, `✅ Seeding finished for *${name}*`);
+      } catch {}
 
-      // 2) DETAILS (worker pool)
-      const concurrency = calcOptimalConcurrency(
-        cfg.scraping.maxConcurrentPages
-      );
-      await notify(chatId, `⚙️ Using *${concurrency}* tabs for details`);
-      let batch;
-      do {
-        batch = await urlsCol
-          .find({ scraped: { $ne: true } })
-          .limit(cfg.scraping.batchSize)
-          .toArray();
-        if (!batch.length) break;
-        logger.info({ target: name, batch: batch.length }, "📦 new batch");
-        await workerPool({
-          browser,
-          urlsCol,
-          detailsCol,
-          docs: batch,
-          concurrency,
-        });
-      } while (batch.length);
+      // === 2) DETAILS ===
+      if (_db && processListing) {
+        const concurrency = calcOptimalConcurrency(
+          cfg.scraping.maxConcurrentPages
+        );
+        try {
+          await tg.notify(chatId, `⚙️ Using *${concurrency}* tabs for details`);
+        } catch {}
+        let batch;
+        do {
+          batch = await _db
+            .collection(`${name}_urls`)
+            .find({ scraped: { $ne: true } })
+            .limit(cfg.scraping.batchSize)
+            .toArray();
+          if (!batch.length) break;
+          logger.info({ target: name, batch: batch.length }, "📦 new batch");
+          await workerPool({
+            browser,
+            urlsCol: _db.collection(`${name}_urls`),
+            detailsCol: _db.collection(name),
+            docs: batch,
+            concurrency,
+          });
+        } while (batch.length);
+      }
 
-      await notify(chatId, `🟢 Details done for *${name}* — starting phones`);
-      logger.info({ target: name }, "☎️ starting phones");
-      // await runPhoneStage({
-      //   baseUrl: cfg.baseUrl,
-      //   authFile: cfg.authFile,
-      //   cookiesFile: cfg.cookiesFile,
-      //   detailsCollection: detailsCol,
-      //   targetsName: name,
-      //   cfgPhones: {
-      //     apiBase: cfg.phones.apiBase,
-      //     leadEndpoint: cfg.phones.leadEndpoint,
-      //     rotateEvery: cfg.phones.rotateEvery,
-      //     delayBetween: cfg.phones.delayBetween,
-      //     maxRetries: cfg.phones.maxRetries,
-      //   },
-      // });
-
-      logger.info({ target: name }, "📤 exporting");
-      await notify(chatId, `📱 Phones done for *${name}* — exporting...`);
-      const out = path.join(
-        process.cwd(),
-        `${name}-${new Date().toISOString().slice(0, 10)}.xlsx`
-      );
-      await exportCollectionToExcel(detailsCol, out);
-      await notify(chatId, `📦 Exported: *${path.basename(out)}*`);
-      logger.info({ target: name, file: out }, "✅ target finished");
+      // === 3) EXPORT (اختياري) ===
+      if (
+        _db &&
+        exporter &&
+        typeof exporter.exportCollectionToExcel === "function"
+      ) {
+        const out = path.join(
+          process.cwd(),
+          `${name}-${new Date().toISOString().slice(0, 10)}.xlsx`
+        );
+        try {
+          await exporter.exportCollectionToExcel(_db.collection(name), out);
+          try {
+            await tg.notify(chatId, `📦 Exported: *${path.basename(out)}*`);
+          } catch {}
+          logger.info({ target: name, file: out }, "✅ target finished");
+        } catch (e) {
+          logger.warn({ target: name, e: String(e) }, "export failed");
+        }
+      }
     }
 
-    await notify(chatId, "🎉 *All targets completed*");
+    try {
+      await tg.notify(chatId, "🎉 *All targets completed*");
+    } catch {}
     logger.info("🎉 All targets completed");
   } catch (e) {
     const msg = String((e && e.message) || e);
     logger.fatal({ err: msg }, "💥 fatal");
-    await notify(chatId, `💥 Fatal: \`${msg}\``);
+    try {
+      await tg.notify(chatId, `💥 Fatal: \`${msg}\``);
+    } catch {}
     throw e;
   } finally {
-    await browser.close();
+    try {
+      await browser.close();
+    } catch {}
   }
 }
 
 if (require.main === module) {
-  main().catch(console.error);
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
 }

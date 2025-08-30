@@ -31,6 +31,7 @@ module.exports = {
     {
       url: "https://aqarmap.com.eg/ar/for-rent/property-type/cairo/heliopolis/?location=cairo%2Fheliopolis%2Ccairo%2Fnasr-city&amp;sort=publishedAt&amp;byOwnerOnly=1&amp;direction=desc",
       name: "link2",
+      startPage: 1,
     },
   ],
 
