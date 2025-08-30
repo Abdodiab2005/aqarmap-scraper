@@ -19,12 +19,14 @@ module.exports = {
   cookiesFile: "./cookies.json",
   authFile: "./auth.json",
   progressFile: "./progress.json",
+  resumeStrategy: "config",
 
   // Targets (url = صفحة البحث الأساسية، name = اسم كولكشن الداتا النهائية)
   targets: [
     {
       url: "https://aqarmap.com.eg/ar/for-sale/property-type/cairo/heliopolis/?location=cairo/heliopolis,cairo/nasr-city&amp;sort=publishedAt&amp;byOwnerOnly=1&amp;direction=desc",
       name: "link1",
+      startPage: 148,
     },
     {
       url: "https://aqarmap.com.eg/ar/for-rent/property-type/cairo/heliopolis/?location=cairo%2Fheliopolis%2Ccairo%2Fnasr-city&amp;sort=publishedAt&amp;byOwnerOnly=1&amp;direction=desc",
